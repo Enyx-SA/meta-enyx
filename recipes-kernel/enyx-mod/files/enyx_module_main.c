@@ -8,7 +8,8 @@
 #include <linux/device.h>
 #include <linux/platform_device.h>
 
-#include "enyx_h2f_loop.h"
+#include "enyx_io_space.h"
+#include "enyx_dma_buffer.h"
 
 #define MODULE_NAME module_name(THIS_MODULE)
 
@@ -25,22 +26,25 @@ static dev_t enyx_first_chrdev;
 static DECLARE_BITMAP(enyx_minor_used, MAX_CHAR_DEVICES);
 
 struct enyx_char_device {
-    struct enyx_h2f_loop * h2f_loop;
+    union {
+        struct enyx_io_space * io_space;
+        struct enyx_dma_buffer * dma;
+    } ptr;
     int minor;
 };
 
-struct enyx_h2f_drvdata {
+struct enyx_drvdata {
     struct enyx_char_device device[MAX_CHAR_DEVICES];
     resource_size_t phys_addr;
     resource_size_t size;
 };
 
-static struct class * enyx_h2f_loop_class;
+static struct class * enyx_fpga_device_class;
 
 static int
-enyx_create_h2f_loop_device(struct platform_device * pdev)
+enyx_create_io_space_device(struct platform_device * pdev)
 {
-    struct enyx_h2f_drvdata * drvdata = platform_get_drvdata(pdev);
+    struct enyx_drvdata * drvdata = platform_get_drvdata(pdev);
     int err;
 
     /* Reserve minor prior device creation */
@@ -50,33 +54,89 @@ enyx_create_h2f_loop_device(struct platform_device * pdev)
 
 
     /* Create device */
-    err = enyx_h2f_loop_init(&drvdata->device[0].h2f_loop,
+    err = enyx_io_space_init(&drvdata->device[0].ptr.io_space,
                              drvdata->phys_addr, drvdata->size,
                              MAJOR(enyx_first_chrdev), drvdata->device[0].minor,
-                             &pdev->dev, enyx_h2f_loop_class);
+                             &pdev->dev, enyx_fpga_device_class);
     if (err)
-        goto err_h2f_loop_init;
+        goto err_io_space_init;
 
     return 0;
 
-err_h2f_loop_init:
+err_io_space_init:
     clear_bit(drvdata->device[0].minor, enyx_minor_used);
     return err;
+}
+
+static void
+enyx_destroy_io_space_device(struct platform_device * pdev)
+{
+    struct enyx_drvdata * drvdata = platform_get_drvdata(pdev);
+
+    enyx_io_space_destroy(drvdata->device[0].ptr.io_space);
+    clear_bit(drvdata->device[0].minor, enyx_minor_used);
+}
+
+static int
+enyx_create_dma_device(struct platform_device * pdev)
+{
+    struct enyx_drvdata * drvdata = platform_get_drvdata(pdev);
+    int err;
+
+    /* Reserve minor prior device creation */
+    drvdata->device[1].minor = find_first_zero_bit(enyx_minor_used,
+                                                   sizeof(enyx_minor_used));
+    set_bit(drvdata->device[1].minor, enyx_minor_used);
+
+
+    /* Create device */
+    err = enyx_dma_buffer_init(&drvdata->device[1].ptr.dma,
+                        PAGE_SIZE,
+                        MAJOR(enyx_first_chrdev), drvdata->device[1].minor,
+                        &pdev->dev, enyx_fpga_device_class);
+    if (err)
+        goto err_io_space_init;
+
+    return 0;
+
+err_io_space_init:
+    clear_bit(drvdata->device[1].minor, enyx_minor_used);
+    return err;
+}
+
+static void
+enyx_destroy_dma_device(struct platform_device * pdev)
+{
+    struct enyx_drvdata * drvdata = platform_get_drvdata(pdev);
+
+    enyx_dma_buffer_destroy(drvdata->device[1].ptr.dma);
+    clear_bit(drvdata->device[1].minor, enyx_minor_used);
 }
 
 static int
 enyx_create_devices(struct platform_device * pdev)
 {
-    return enyx_create_h2f_loop_device(pdev);
+    int err;
+
+    err = enyx_create_io_space_device(pdev);
+    if (err)
+        goto err_enyx_create_io_space_device;
+
+    err = enyx_create_dma_device(pdev);
+    if (err)
+        goto err_enyx_create_dma_device;
+
+err_enyx_create_dma_device:
+    enyx_destroy_io_space_device(pdev);
+err_enyx_create_io_space_device:
+    return err;
 }
 
 static void
 enyx_destroy_char_device(struct platform_device * pdev)
 {
-    struct enyx_h2f_drvdata * drvdata = platform_get_drvdata(pdev);
-
-    enyx_h2f_loop_destroy(drvdata->device[0].h2f_loop);
-    clear_bit(drvdata->device[0].minor, enyx_minor_used);
+    enyx_destroy_dma_device(pdev);
+    enyx_destroy_io_space_device(pdev);
 }
 
 static void
@@ -88,7 +148,7 @@ enyx_destroy_devices(struct platform_device * pdev)
 static int
 h2f_remove(struct platform_device *pdev)
 {
-    struct enyx_h2f_drvdata * drvdata = platform_get_drvdata(pdev);
+    struct enyx_drvdata * drvdata = platform_get_drvdata(pdev);
 
     dev_dbg(&pdev->dev, "Removing\n");
 
@@ -104,7 +164,7 @@ h2f_remove(struct platform_device *pdev)
 static int
 h2f_probe(struct platform_device *pdev)
 {
-    struct enyx_h2f_drvdata * drvdata;
+    struct enyx_drvdata * drvdata;
 	struct resource *r;
 	int err;
 
@@ -175,10 +235,10 @@ enyx_init_module(void)
                                    MODULE_NAME)) < 0)
         goto err_alloc_chrdev_region;
 
-    enyx_h2f_loop_class = class_create(THIS_MODULE, "h2f_loop");
-    if (IS_ERR(enyx_h2f_loop_class)) {
-        err = PTR_ERR(enyx_h2f_loop_class);
-        pr_err("Can't create sysfs 'h2f_loop' class\n");
+    enyx_fpga_device_class = class_create(THIS_MODULE, "fpga_device");
+    if (IS_ERR(enyx_fpga_device_class)) {
+        err = PTR_ERR(enyx_fpga_device_class);
+        pr_err("Can't create sysfs 'fpga_device' class\n");
         goto err_class_create;
     }
 
@@ -190,7 +250,7 @@ enyx_init_module(void)
     return 0;
 
 err_h2f_platform_register_driver:
-    class_destroy(enyx_h2f_loop_class);
+    class_destroy(enyx_fpga_device_class);
 err_class_create:
     unregister_chrdev_region(enyx_first_chrdev, MAX_CHAR_DEVICES);
 err_alloc_chrdev_region:
@@ -204,7 +264,7 @@ enyx_exit_module(void)
 {
 	platform_driver_unregister(&h2f_platform_driver);
 
-    class_destroy(enyx_h2f_loop_class);
+    class_destroy(enyx_fpga_device_class);
 
     unregister_chrdev_region(enyx_first_chrdev, MAX_CHAR_DEVICES);
 }

@@ -1,5 +1,5 @@
 obj-m := enyx_module.o
-enyx_module-y := enyx_module_main.o enyx_h2f_loop.o
+enyx_module-y := enyx_module_main.o enyx_io_space.o enyx_dma_buffer.o
 
 SRC := $(shell pwd)
 
